@@ -108,6 +108,20 @@ def test_canonicalize_version_no_strip_trailing_zero(version: str) -> None:
     assert canonicalize_version(version, strip_trailing_zero=False) == version
 
 
+def test_canonicalize_version_subclass() -> None:
+    class LabeledVersion(Version):
+        def __init__(self, value: str) -> None:
+            super().__init__(value)
+            self.label = "display"
+
+        def __str__(self) -> str:
+            return f"{super().__str__()} ({self.label})"
+
+    value = LabeledVersion("1.0.0")
+    assert canonicalize_version(value) == "1"
+    assert canonicalize_version(value, strip_trailing_zero=False) == "1.0.0 (display)"
+
+
 @pytest.mark.parametrize(
     ("filename", "name", "version", "build", "tags"),
     [

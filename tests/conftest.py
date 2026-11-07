@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import gc
 import sysconfig
+from typing import TYPE_CHECKING
 
 from packaging.markers import _cached_default_environment
+
+if TYPE_CHECKING:
+    import pytest
 
 
 # default_environment() is cached, so tests that patch platform/sys must run
@@ -24,12 +28,16 @@ def pytest_collection() -> None:
     gc.disable()
 
 
-def pytest_collection_finish() -> None:
+def pytest_collection_finish(session: pytest.Session) -> None:
     # Freeze the collected-item tree and imported modules into GC's permanent
     # generation so per-test GC passes stop traversing them (~10% faster suite).
     gc.enable()
     gc.collect()
-    if hasattr(gc, "freeze"):  # CPython-only; missing on PyPy
+    # Hypothesis inspects GC referrers when registering its random generators.
+    property_tests = any(
+        item.get_closest_marker("property") is not None for item in session.items
+    )
+    if not property_tests and hasattr(gc, "freeze"):  # CPython-only; missing on PyPy
         gc.freeze()
 
 

@@ -83,6 +83,7 @@ tou = "tou"
 [tool.coverage.run]
 branch = true
 source_pkgs = ["packaging"]
+relative_files = true
 
 [tool.coverage.report]
 show_missing = true
@@ -121,6 +122,8 @@ markers = ["property: property-based tests (opt-in)"]
 
 
 [tool.mypy]
+mypy_path = ["src", "typings"]
+explicit_package_bases = true
 strict = true
 enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 warn_unused_ignores = true
