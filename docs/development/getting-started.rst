@@ -45,6 +45,24 @@ each supported Python version and run the tests. For example:
 You may not have all the required Python versions installed, in which case you
 will see one or more ``InterpreterNotFound`` errors.
 
+Checking both version backends locally
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Check native coverage locally with a Python build providing
+``importlib.version``. Combine it with coverage from an interpreter without that
+module to enforce the 100% statement and branch requirement:
+
+.. code-block:: console
+
+    $ python3.16 -c "import importlib.version"
+    $ COVERAGE_FILE=.coverage.native python3.16 -m coverage run -m pytest
+    $ COVERAGE_FILE=.coverage.python python3.10 -m coverage run -m pytest
+    $ python3.16 -m coverage combine .coverage.native .coverage.python
+    $ python3.16 -m coverage report
+
+Use Python 3.10 for the fallback run to cover subclass pickling without
+``object.__getstate__``.
+
 Running property-based tests
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

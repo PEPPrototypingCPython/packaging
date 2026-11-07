@@ -7,6 +7,12 @@ versions.
 See `Version Specifiers Specification`_ for more details on the exact
 format implemented in this module, for use in Python Packaging tooling.
 
+When the interpreter provides ``importlib.version``,
+:class:`~packaging.version.Version` subclasses its native version type.
+Other interpreters use the Python implementation.
+Pickles use the public ``packaging.version`` names and can be restored with
+either implementation.
+
 .. _Version Specifiers Specification: https://packaging.python.org/en/latest/specifications/version-specifiers/
 
 Usage
