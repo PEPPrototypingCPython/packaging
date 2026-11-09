@@ -16,9 +16,10 @@ from ._version_support import (
     LegacyVersion,
     comparison_key,
     deprecated,
-    legacy_version_parts,
+    legacy_components,
     parse_local_version,
-    restore_subclass_state,
+    trim_release,
+    version_parts,
 )
 
 if TYPE_CHECKING:
@@ -31,24 +32,33 @@ class InvalidVersion(_NativeInvalidVersion):
     """Raised when a version string or component is invalid."""
 
 
-class Version(_NativeVersion):
+# BaseVersion accepts legacy subclasses that the native comparison stubs reject.
+class Version(_NativeVersion, BaseVersion):  # type: ignore[misc]
     """A PEP 440 version backed by the interpreter's native value type."""
 
     __slots__ = ()
     __match_args__ = ("_str",)
     __mutable_version__ = True
     __invalid_version__ = InvalidVersion
+    # Native values keep no Python key cache, so consumers use the operators.
+    _key_cache: None = None
+
+    def _legacy_parts(self) -> LegacyVersion:
+        return LegacyVersion(
+            self.epoch,
+            self.release,
+            None if self.dev is None else ("dev", self.dev),
+            self.pre,
+            None if self.post is None else ("post", self.post),
+            parse_local_version(self.local),
+        )
 
     @property
     def _key(self) -> CmpKey:
         # Legacy version classes compare using the historical tuple contract.
+        parts = self._legacy_parts()
         return comparison_key(
-            self.epoch,
-            self.release,
-            self.pre,
-            None if self.post is None else ("post", self.post),
-            None if self.dev is None else ("dev", self.dev),
-            parse_local_version(self.local),
+            parts.epoch, parts.release, parts.pre, parts.post, parts.dev, parts.local
         )
 
     @property
@@ -57,39 +67,23 @@ class Version(_NativeVersion):
 
     @override
     def __setstate__(self, state: object) -> None:
-        if type(self) is not Version and restore_subclass_state(self, state):
-            return
-        restored = Version.from_parts(**legacy_version_parts(state))
-        super().__setstate__(restored)
+        legacy = legacy_components(state)
+        if legacy is not None:
+            state = type(self).from_parts(**version_parts(legacy))
+        elif type(self) is Version:
+            # A plain Version carries no subclass state.
+            raise TypeError(f"Cannot restore Version from {state!r}")
+        super().__setstate__(state)
 
     @property
     @deprecated("Version._version is private and will be removed soon")
     def _version(self) -> LegacyVersion:
-        local = self.local
-        return LegacyVersion(
-            self.epoch,
-            self.release,
-            None if self.dev is None else ("dev", self.dev),
-            self.pre,
-            None if self.post is None else ("post", self.post),
-            parse_local_version(local),
-        )
+        return self._legacy_parts()
 
     @_version.setter
     @deprecated("Version._version is private and will be removed soon")
     def _version(self, value: LegacyVersion) -> None:
-        snapshot = _NativeVersion.from_parts(
-            epoch=value.epoch,
-            release=value.release,
-            pre=value.pre,
-            post=None if value.post is None else value.post[1],
-            dev=None if value.dev is None else value.dev[1],
-            local=None if value.local is None else ".".join(map(str, value.local)),
-        )
-        super().__setstate__(snapshot)
-
-
-BaseVersion.register(Version)
+        super().__setstate__(_NativeVersion.from_parts(**version_parts(value)))
 
 
 class TrimmedRelease(Version):
@@ -101,13 +95,9 @@ class TrimmedRelease(Version):
         if version is UNSET:
             return super().__new__(cls)
         parsed = version if isinstance(version, Version) else Version(version)
-        release = parsed.release
-        end = len(release)
-        while end > 1 and release[end - 1] == 0:
-            end -= 1
         return cls.from_parts(
             epoch=parsed.epoch,
-            release=release[:end],
+            release=parsed.release,
             pre=parsed.pre,
             post=parsed.post,
             dev=parsed.dev,
@@ -129,20 +119,8 @@ class TrimmedRelease(Version):
         value = super().from_parts(
             epoch=epoch, release=release, pre=pre, post=post, dev=dev, local=local
         )
-        normalized = value.release
-        end = len(normalized)
-        while end > 1 and normalized[end - 1] == 0:
-            end -= 1
-        if end == len(normalized):
-            return value
-        return _NativeVersion.__replace__(value, release=normalized[:end])
+        return value.__replace__(release=trim_release(value.release))
 
     def __init__(self, version: str | Version) -> None:
+        # __new__ returns a built value, which the native initializer rejects.
         pass
-
-    @override
-    def __setstate__(self, state: object) -> None:
-        if restore_subclass_state(self, state):
-            return
-        value = TrimmedRelease.from_parts(**legacy_version_parts(state))
-        _NativeVersion.__setstate__(self, value)

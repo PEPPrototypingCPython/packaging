@@ -15,12 +15,32 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from packaging.version import InvalidVersion, Version, normalize_pre, parse
+from packaging import _version_python, _version_support
+from packaging.version import (
+    InvalidVersion,
+    Version,
+    _TrimmedRelease,
+    normalize_pre,
+    parse,
+)
 
 if TYPE_CHECKING:
     from typing import NoReturn
 
 _version = pytest.importorskip("importlib.version")
+
+
+def run_child(code: str) -> None:
+    """Run ``code`` in a fresh interpreter, which must end by printing the module."""
+    child = subprocess.run(
+        [sys.executable, "-X", "faulthandler", "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert child.returncode == 0, child.stderr
+    assert child.stdout.strip() == _version.__spec__.name
 
 
 class DisplayVersion(Version):
@@ -94,15 +114,7 @@ value = Version.from_parts(release=(1, Probe(0)))
 assert hash(value) == hash(Version('1'))
 print(_version.__spec__.name)
 """
-    child = subprocess.run(
-        [sys.executable, "-X", "faulthandler", "-c", code],
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    assert child.returncode == 0, child.stderr
-    assert child.stdout.strip() == _version.__spec__.name
+    run_child(code)
 
 
 def test_concurrent_first_hash_publishes_one_result() -> None:
@@ -217,24 +229,31 @@ tracemalloc.stop()
 assert retained < 2 * sys.getsizeof(expected), retained
 print(_version.__spec__.name)
 """
-    child = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    assert child.returncode == 0, child.stderr
-    assert child.stdout.strip() == _version.__spec__.name
+    run_child(code)
 
 
-def test_public_version_examples() -> None:
-    failures, _ = doctest.testfile(
-        "version_examples.txt",
-        globs={"Version": Version, "normalize_pre": normalize_pre, "parse": parse},
-        optionflags=doctest.ELLIPSIS,
+def test_python_backend_examples_hold_for_native_values() -> None:
+    # The Python backend's docstrings document the public behavior.
+    finder = doctest.DocTestFinder()
+    runner = doctest.DocTestRunner(optionflags=doctest.ELLIPSIS)
+    globs = {
+        "Version": Version,
+        "_TrimmedRelease": _TrimmedRelease,
+        "normalize_pre": normalize_pre,
+        "parse": parse,
+    }
+    documented = (
+        _version_python.Version,
+        _version_python.TrimmedRelease,
+        _version_support.InvalidVersion,
+        normalize_pre,
+        parse,
     )
-    assert failures == 0
+    for obj in documented:
+        for test in finder.find(obj, module=False, globs=globs):
+            runner.run(test)
+    assert runner.tries > 50
+    assert runner.failures == 0
 
 
 def test_tuple_subclass_hooks_do_not_define_release_storage() -> None:
@@ -283,12 +302,4 @@ value = Version('9' * 7000 + '.0')
 assert value.release[0] == int('9' * 7000)
 print(_version.__spec__.name)
 """
-    child = subprocess.run(
-        [sys.executable, "-X", "faulthandler", "-c", code],
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    assert child.returncode == 0, child.stderr
-    assert child.stdout.strip() == _version.__spec__.name
+    run_child(code)
