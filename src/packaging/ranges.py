@@ -45,8 +45,8 @@ from ._ranges import (
     range_is_empty,
     ranges_are_disjoint,
     ranges_are_prerelease_only,
-    trim_release,
 )
+from ._version_support import trim_release
 from .version import Version
 
 if TYPE_CHECKING:

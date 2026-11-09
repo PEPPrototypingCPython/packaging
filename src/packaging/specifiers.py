@@ -31,8 +31,8 @@ from ._ranges import (
     matches_bounds_only,
     ranges_are_prerelease_only,
     resolve_prereleases,
-    trim_release,
 )
+from ._version_support import trim_release
 from .utils import canonicalize_version
 from .version import Version
 

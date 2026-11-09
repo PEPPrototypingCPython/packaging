@@ -4,25 +4,22 @@
 """
 .. testsetup::
 
-    from packaging.version import parse, normalize_pre, Version, comparison_key
+    from packaging.version import Version
+    from packaging._version_support import comparison_key, normalize_pre
 """
 
 from __future__ import annotations
 
 import builtins
+import copyreg
 import re
 import sys
 import typing
-from abc import ABCMeta
-from collections.abc import Callable
-from importlib import import_module
-from typing import (
-    Any,
-    Literal,
-    NamedTuple,
-    SupportsInt,
-    TypedDict,
-)
+from typing import Any, Literal, NamedTuple, SupportsInt
+
+if typing.TYPE_CHECKING:
+    from collections.abc import Callable
+    from typing import TypedDict
 
 if sys.version_info >= (3, 13):  # pragma: no cover
     from warnings import deprecated as deprecated  # noqa: PLC0414 - Strict re-export.
@@ -74,9 +71,6 @@ CmpKey = (
 )
 
 
-VersionComparisonMethod = Callable[[CmpKey, CmpKey], bool]
-
-
 # Sentinel for __replace__, typed as Any so it can be the default for any field.
 # mypy is missing sentinel currently
 UNSET: Any = object() if sys.version_info < (3, 15) else builtins.sentinel("UNSET")  # type: ignore[attr-defined]
@@ -113,21 +107,7 @@ class InvalidVersion(ValueError):
     """
 
 
-if typing.TYPE_CHECKING:
-    ComparisonMeta = ABCMeta
-else:
-    try:
-        import_module("importlib.version")
-    except ModuleNotFoundError as exc:
-        if exc.name != "importlib.version":
-            raise
-        ComparisonMeta = type
-    else:
-        ComparisonMeta = ABCMeta
-
-
-# Virtual native membership is unnecessary on the Python-only backend.
-class BaseVersion(metaclass=ComparisonMeta):
+class BaseVersion:
     __slots__ = ()
 
     # This can also be a normal member (see the packaging_legacy package);
@@ -256,6 +236,14 @@ _LOCAL_PATTERN = re.compile(r"[a-z0-9]+(?:[._-][a-z0-9]+)*", re.IGNORECASE | re.
 SIMPLE_VERSION_INDICATORS = frozenset(".0123456789")
 
 
+def trim_release(release: tuple[int, ...]) -> tuple[int, ...]:
+    """Strip trailing zeros from a release tuple for normalized comparison."""
+    end = len(release)
+    while end > 1 and release[end - 1] == 0:
+        end -= 1
+    return release if end == len(release) else release[:end]
+
+
 def validate_epoch(value: object, /) -> int:
     epoch = value or 0
     if isinstance(epoch, int) and epoch >= 0:
@@ -335,22 +323,13 @@ def subclass_state(value: object, excluded: tuple[str, ...] = ()) -> object:
     if sys.version_info >= (3, 11):
         state = object.__getstate__(value)
     else:
-        # Python 3.10 has no object.__getstate__; subclasses may add arbitrary slots.
+        # Python 3.10 has no object.__getstate__.
         dictionary = getattr(value, "__dict__", None)
-        slots: dict[str, object] = {}
-        for cls in type(value).__mro__:
-            names = cls.__dict__.get("__slots__", ())
-            if isinstance(names, str):
-                names = (names,)
-            for slot_name in names:
-                if slot_name in {"__dict__", "__weakref__"}:
-                    continue
-                name = slot_name
-                if slot_name.startswith("__") and not slot_name.endswith("__"):
-                    name = "_" + cls.__name__.lstrip("_") + slot_name
-                item = getattr(value, name, UNSET)
-                if item is not UNSET:
-                    slots[name] = item
+        slots = {
+            name: getattr(value, name)
+            for name in copyreg._slotnames(type(value))  # type: ignore[attr-defined]
+            if hasattr(value, name)
+        }
         state = (dictionary, slots) if slots else dictionary
     if isinstance(state, tuple):
         dictionary, slots = state
@@ -359,39 +338,29 @@ def subclass_state(value: object, excluded: tuple[str, ...] = ()) -> object:
     return state
 
 
-def restore_subclass_state(value: object, state: object) -> bool:
-    """Apply subclass pickle state, excluding historical component states."""
-    dictionary = state
-    slots: dict[str, object] = {}
+def restore_subclass_state(value: object, state: object) -> None:
+    """Apply the dictionary and slot state pickle emits for subclass attributes."""
+    dictionary: object = state
+    slots: object = {}
     if isinstance(state, tuple) and len(state) == 2:
-        dictionary, raw_slots = state
-        if not isinstance(raw_slots, dict) or "_epoch" in raw_slots:
-            return False
-        slots = raw_slots
-    if dictionary is not None and (
-        not isinstance(dictionary, dict) or "_version" in dictionary
+        dictionary, slots = state
+    if (dictionary is not None and not isinstance(dictionary, dict)) or not isinstance(
+        slots, dict
     ):
-        return False
-    if dictionary is not None:
+        raise TypeError(f"Cannot restore {type(value).__name__} from {state!r}")
+    if dictionary:
         value.__dict__.update(dictionary)
-    # Slot names are a dynamic part of the subclass serialization contract.
+    # Copy first: slot setters may mutate the supplied dictionary.
     for name, item in list(slots.items()):
         setattr(value, name, item)
-    return True
 
 
 def parse_letter_version(
     letter: str | None, number: str | bytes | SupportsInt | None
 ) -> tuple[str, int] | None:
     if letter:
-        # We normalize any letters to their lower case form
-        letter = letter.lower()
-
-        # Normalize alternate pre-release names to their short forms.
-        letter = _LETTER_NORMALIZATION.get(letter, letter)
-
         # A missing pre-release number is zero.
-        return letter, int(number or 0)
+        return normalize_pre(letter), int(number or 0)
 
     if number:
         # We assume if we are given a number, but we are not given a letter
@@ -509,41 +478,57 @@ def comparison_key(
     return epoch, trimmed, suffix, cmp_local
 
 
-class VersionParts(TypedDict):
-    epoch: int
-    release: tuple[int, ...]
-    pre: tuple[str, int] | None
-    post: int | None
-    dev: int | None
-    local: str | None
+if typing.TYPE_CHECKING:
+
+    class VersionParts(TypedDict):
+        epoch: int
+        release: tuple[int, ...]
+        pre: tuple[str, int] | None
+        post: int | None
+        dev: int | None
+        local: str | None
 
 
-def legacy_version_parts(state: object) -> VersionParts:
-    """Decode and validate historical component pickle formats."""
+def legacy_components(state: object) -> LegacyVersion | None:
+    """Decode the component layouts written by earlier packaging releases.
+
+    Returns ``None`` for any other state, such as subclass attributes.
+    """
     if isinstance(state, tuple) and len(state) == 6:
+        # packaging 26.2+: (epoch, release, pre, post, dev, local)
         epoch, release, pre, post, dev, local = state
-    elif isinstance(state, tuple) and len(state) == 2 and isinstance(state[1], dict):
+        return LegacyVersion(epoch, release, dev, pre, post, local)
+    if (
+        isinstance(state, tuple)
+        and len(state) == 2
+        and isinstance(state[1], dict)
+        and "_epoch" in state[1]
+    ):
+        # packaging 26.0-26.1: (None, {slot: value})
         slots = state[1]
-        epoch, release = slots["_epoch"], slots["_release"]
-        pre, post, dev, local = (
-            slots.get(name) for name in ("_pre", "_post", "_dev", "_local")
+        return LegacyVersion(
+            slots["_epoch"],
+            slots["_release"],
+            slots.get("_dev"),
+            slots.get("_pre"),
+            slots.get("_post"),
+            slots.get("_local"),
         )
-    elif isinstance(state, dict) and isinstance(state.get("_version"), LegacyVersion):
-        version = state["_version"]
-        epoch, release = version.epoch, version.release
-        pre, post, dev, local = version.pre, version.post, version.dev, version.local
-    else:
-        raise TypeError(f"Cannot restore Version from {state!r}")
-    normalized_epoch = validate_epoch(epoch)
-    normalized_release = validate_release(release)
-    normalized_pre = validate_pre(pre)
-    normalized_post = validate_post(None if post is None else post[1])
-    normalized_dev = validate_dev(None if dev is None else dev[1])
+    if isinstance(state, dict):
+        # packaging <= 25.x: {"_version": _Version(...), "_key": ...}
+        legacy = state.get("_version")
+        if isinstance(legacy, LegacyVersion):
+            return legacy
+    return None
+
+
+def version_parts(legacy: LegacyVersion) -> VersionParts:
+    """Convert legacy components into ``from_parts`` keyword arguments."""
     return {
-        "epoch": normalized_epoch,
-        "release": normalized_release,
-        "pre": normalized_pre,
-        "post": None if normalized_post is None else normalized_post[1],
-        "dev": None if normalized_dev is None else normalized_dev[1],
-        "local": None if local is None else ".".join(map(str, local)),
+        "epoch": legacy.epoch,
+        "release": legacy.release,
+        "pre": legacy.pre,
+        "post": None if legacy.post is None else legacy.post[1],
+        "dev": None if legacy.dev is None else legacy.dev[1],
+        "local": None if legacy.local is None else ".".join(map(str, legacy.local)),
     }

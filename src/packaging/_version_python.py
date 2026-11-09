@@ -21,10 +21,12 @@ from ._version_support import (
     LocalType,
     comparison_key,
     deprecated,
+    legacy_components,
     parse_letter_version,
     parse_local_version,
     restore_subclass_state,
     subclass_state,
+    trim_release,
     validate_dev,
     validate_epoch,
     validate_local,
@@ -490,54 +492,30 @@ class Version(BaseVersion):
 
     def __getstate__(self) -> object:
         # Core components are constructor arguments; state belongs to subclasses.
-        return subclass_state(self, _PythonVersion.__slots__)
+        if type(self) is Version:
+            return None
+        return subclass_state(self, Version.__slots__)
 
     def __setstate__(self, state: object) -> None:
-        if type(self) is not _PythonVersion and restore_subclass_state(self, state):
+        legacy = legacy_components(state)
+        if legacy is None:
+            if type(self) is Version:
+                # A plain Version carries no subclass state.
+                raise TypeError(f"Cannot restore Version from {state!r}")
+            restore_subclass_state(self, state)
             return
-        # Always discard cached values: they may contain stale references
-        # (e.g. packaging._structures.InfinityType from pre-26.1 pickles)
-        # and will be recomputed on demand from the core fields above.
+        # Discard cached values: old pickles may hold stale references
+        # (e.g. packaging._structures.InfinityType from pre-26.1 pickles).
         self._key_cache = None
         self._hash_cache = None
-
-        if isinstance(state, tuple):
-            if len(state) == 6:
-                # New format (26.2+): (epoch, release, pre, post, dev, local)
-                (
-                    self._epoch,
-                    self._release,
-                    self._pre,
-                    self._post,
-                    self._dev,
-                    self._local,
-                ) = state
-                return
-            if len(state) == 2:
-                # Format (packaging 26.0-26.1): (None, {slot: value}).
-                _, slot_dict = state
-                if isinstance(slot_dict, dict):
-                    self._epoch = slot_dict["_epoch"]
-                    self._release = slot_dict["_release"]
-                    self._pre = slot_dict.get("_pre")
-                    self._post = slot_dict.get("_post")
-                    self._dev = slot_dict.get("_dev")
-                    self._local = slot_dict.get("_local")
-                    return
-        if isinstance(state, dict):
-            # Old format (packaging <= 25.x, no __slots__): state is a plain
-            # dict with "_version" (LegacyVersion NamedTuple) and "_key" entries.
-            version_nt = state.get("_version")
-            if version_nt is not None:
-                self._epoch = version_nt.epoch
-                self._release = version_nt.release
-                self._pre = version_nt.pre
-                self._post = version_nt.post
-                self._dev = version_nt.dev
-                self._local = version_nt.local
-                return
-
-        raise TypeError(f"Cannot restore Version from {state!r}")
+        (
+            self._epoch,
+            self._release,
+            self._dev,
+            self._pre,
+            self._post,
+            self._local,
+        ) = legacy
 
     @property
     @deprecated("Version._version is private and will be removed soon")
@@ -794,9 +772,6 @@ class Version(BaseVersion):
         return self.release[2] if len(self.release) >= 3 else 0
 
 
-_PythonVersion = Version
-
-
 class TrimmedRelease(Version):
     __slots__ = ()
 
@@ -823,10 +798,4 @@ class TrimmedRelease(Version):
         >>> _TrimmedRelease('0.0').release
         (0,)
         """
-        # This leaves one 0.
-        rel = super().release
-        len_release = len(rel)
-        i = len_release
-        while i > 1 and rel[i - 1] == 0:
-            i -= 1
-        return rel if i == len_release else rel[:i]
+        return trim_release(super().release)

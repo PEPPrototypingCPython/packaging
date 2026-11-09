@@ -13,15 +13,16 @@ from typing import (
     Final,
 )
 
-from .version import USE_NATIVE_VERSION, InvalidVersion, Version
+from ._version_support import trim_release
+from .version import InvalidVersion, Version
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator, Sequence
 
-    _NativeBoundaryOrderKey = tuple[Version, bool, Version]
+    # Total-order key for comparing two boundaries (boundary-vs-boundary only).
+    # The post slot may be ``_BOUNDARY_INF`` for an AFTER_POSTS boundary.
     _BoundaryOrderSuffix = tuple[int, int, int, int | float, int, int]
-    _PythonBoundaryOrderKey = tuple[int, tuple[int, ...], _BoundaryOrderSuffix, float]
-    _BoundaryOrderKey = _NativeBoundaryOrderKey
+    _BoundaryOrderKey = tuple[int, tuple[int, ...], _BoundaryOrderSuffix, float]
 
 __all__ = [
     "FULL_RANGE",
@@ -47,7 +48,8 @@ MIN_VERSION: Final[Version] = Version("0.dev0")
 #: above the ``-inf`` floor.
 MIN_RELEASE: Final[Version] = Version("0")
 
-
+#: Sorts above any real post number and any local label, so a boundary can be
+#: ordered above the version family it covers when two boundaries are compared.
 _BOUNDARY_INF: Final[float] = float("inf")
 
 
@@ -83,7 +85,7 @@ class BoundaryVersion:
         "version",
     )
 
-    # Python boundaries bypass the ordinary version key cache.
+    # Synthetic boundaries must use version operators rather than cached keys.
     _key_cache: None = None
 
     def __init__(self, version: Version, kind: BoundaryKind) -> None:
@@ -121,44 +123,38 @@ class BoundaryVersion:
         # Post family: V itself + any post-release of V.
         return other.dev == self._cached_dev or other.post is not None
 
-    def _python_order_key(self) -> _PythonBoundaryOrderKey:
-        """Order a synthetic boundary using the Python version tuple layout."""
-        version_key = self.version._key
-        suffix: _BoundaryOrderSuffix = version_key[2]
-        if self.kind == BoundaryKind.AFTER_POSTS:
-            suffix = (suffix[0], suffix[1], 1, _BOUNDARY_INF, 1, 0)
-        return version_key[0], version_key[1], suffix, _BOUNDARY_INF
+    def _order_key(self) -> _BoundaryOrderKey:
+        """Sort key placing this boundary just above the versions it covers.
 
-    def _native_order_key(self) -> _BoundaryOrderKey:
-        """Order synthetic boundaries through public version comparisons."""
+        It extends ``V``'s comparison key ``(epoch, release, suffix)`` with
+        a trailing ``_BOUNDARY_INF`` local component, so the key sorts after
+        ``V`` and every ``V+local`` (whose keys carry a real, finite local
+        segment). ``suffix`` is the 6-int comparison suffix
+        ``(pre_rank, pre_n, post_rank, post_n, dev_rank, dev_n)``.
+
+        For an AFTER_POSTS boundary the suffix is replaced with one whose
+        post number is ``_BOUNDARY_INF``, so the key also sorts after every
+        ``V.postN``. An AFTER_LOCALS boundary uses ``V``'s suffix unchanged.
+        """
         if self._cached_order_key is None:
-            version = self.version
-            dev_only = (
-                version.pre is None and version.post is None and version.dev is not None
-            )
-            prefix = version.__replace__(
-                post=None, dev=0 if dev_only else None, local=None
-            )
-            after_posts = self.kind == BoundaryKind.AFTER_POSTS
-            # A post-family boundary follows every post number in its prefix.
-            within = prefix if after_posts else version.__replace__(local=None)
-            self._cached_order_key = prefix, after_posts, within
+            version_key = self.version._key
+            suffix: _BoundaryOrderSuffix = version_key[2]
+            if self.kind == BoundaryKind.AFTER_POSTS:
+                suffix = (suffix[0], suffix[1], 1, _BOUNDARY_INF, 1, 0)
+            key = version_key[0], version_key[1], suffix, _BOUNDARY_INF
+            self._cached_order_key = key
         return self._cached_order_key
 
     def __eq__(self, other: object) -> bool:
         # Key off the order key so equality matches the ``<`` / ``>`` order:
         # ``AFTER_POSTS(1.0)`` and ``AFTER_POSTS(1.0.post1)`` are the same point.
         if isinstance(other, BoundaryVersion):
-            if USE_NATIVE_VERSION:
-                return self._native_order_key() == other._native_order_key()
-            return self._python_order_key() == other._python_order_key()
+            return self._order_key() == other._order_key()
         return NotImplemented
 
     def __lt__(self, other: BoundaryVersion | Version) -> bool:
         if isinstance(other, BoundaryVersion):
-            if USE_NATIVE_VERSION:
-                return self._native_order_key() < other._native_order_key()
-            return self._python_order_key() < other._python_order_key()
+            return self._order_key() < other._order_key()
         # boundary < other_version iff V < other AND other not in family.
         # The cheap V >= other path short-circuits before the family check.
         if not (self.version < other):
@@ -169,18 +165,14 @@ class BoundaryVersion:
         # Defined directly to bypass functools.total_ordering's
         # NotImplemented round-trip on reflected ``Version < boundary``.
         if isinstance(other, BoundaryVersion):
-            if USE_NATIVE_VERSION:
-                return self._native_order_key() > other._native_order_key()
-            return self._python_order_key() > other._python_order_key()
+            return self._order_key() > other._order_key()
         if self.version >= other:
             return True
         return self._is_family(other)
 
     def __hash__(self) -> int:
         # Keyed to ``__eq__`` (the order key), so equal boundaries hash equal.
-        if USE_NATIVE_VERSION:
-            return hash(self._native_order_key())
-        return hash(self._python_order_key())
+        return hash(self._order_key())
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}({self.version!r}, {self.kind.name})"
@@ -231,113 +223,63 @@ class LowerBound:
             return NotImplemented
         return self.version == other.version and self.inclusive == other.inclusive
 
-    if USE_NATIVE_VERSION:
+    def __lt__(self, other: LowerBound) -> bool:
+        if not isinstance(other, LowerBound):
+            return NotImplemented
+        # -inf < anything (except -inf itself).
+        if self.version is None:
+            return other.version is not None
+        if other.version is None:
+            return False
 
-        def __lt__(self, other: LowerBound) -> bool:
-            if not isinstance(other, LowerBound):
-                return NotImplemented
-            # -inf < anything (except -inf itself).
-            if self.version is None:
-                return other.version is not None
-            if other.version is None:
-                return False
-
+        # Use cached keys when both exist; cold versions and boundaries use operators.
+        self_key = self.version._key_cache
+        other_key = other.version._key_cache
+        if self_key is None or other_key is None:
             if self.version != other.version:
                 return self.version < other.version
+        elif self_key != other_key:
+            return self_key < other_key
 
-            # [v < (v: inclusive starts earlier.
-            return self.inclusive and not other.inclusive
-    else:
-
-        def __lt__(self, other: LowerBound) -> bool:
-            if not isinstance(other, LowerBound):
-                return NotImplemented
-            # -inf < anything (except -inf itself).
-            if self.version is None:
-                return other.version is not None
-            if other.version is None:
-                return False
-
-            # Warm Python values compare their cached keys directly.
-            self_key = self.version._key_cache
-            other_key = other.version._key_cache
-            if self_key is None or other_key is None:
-                if self.version != other.version:
-                    return self.version < other.version
-            elif self_key != other_key:
-                return self_key < other_key
-
-            # [v < (v: inclusive starts earlier.
-            return self.inclusive and not other.inclusive
+        # [v < (v: inclusive starts earlier.
+        return self.inclusive and not other.inclusive
 
     # Explicit operators avoid total_ordering's repeated comparison dispatch.
-    if USE_NATIVE_VERSION:
+    def __gt__(self, other: LowerBound) -> bool:
+        if not isinstance(other, LowerBound):
+            return NotImplemented
+        if self.version is None:
+            return False
+        if other.version is None:
+            return True
 
-        def __gt__(self, other: LowerBound) -> bool:
-            if not isinstance(other, LowerBound):
-                return NotImplemented
-            if self.version is None:
-                return False
-            if other.version is None:
-                return True
-
+        self_key = self.version._key_cache
+        other_key = other.version._key_cache
+        if self_key is None or other_key is None:
             if self.version != other.version:
                 return other.version < self.version
+        elif self_key != other_key:
+            return other_key < self_key
 
-            return other.inclusive and not self.inclusive
-    else:
+        return other.inclusive and not self.inclusive
 
-        def __gt__(self, other: LowerBound) -> bool:
-            if not isinstance(other, LowerBound):
-                return NotImplemented
-            if self.version is None:
-                return False
-            if other.version is None:
-                return True
+    def __le__(self, other: LowerBound) -> bool:
+        if not isinstance(other, LowerBound):
+            return NotImplemented
+        if self.version is None:
+            return True
+        if other.version is None:
+            return False
 
-            self_key = self.version._key_cache
-            other_key = other.version._key_cache
-            if self_key is None or other_key is None:
-                if self.version != other.version:
-                    return other.version < self.version
-            elif self_key != other_key:
-                return other_key < self_key
-
-            return other.inclusive and not self.inclusive
-
-    if USE_NATIVE_VERSION:
-
-        def __le__(self, other: LowerBound) -> bool:
-            if not isinstance(other, LowerBound):
-                return NotImplemented
-            if self.version is None:
-                return True
-            if other.version is None:
-                return False
-
+        self_key = self.version._key_cache
+        other_key = other.version._key_cache
+        if self_key is None or other_key is None:
             if self.version != other.version:
                 return self.version < other.version
+        elif self_key != other_key:
+            return self_key < other_key
 
-            return self.inclusive or not other.inclusive
-    else:
-
-        def __le__(self, other: LowerBound) -> bool:
-            if not isinstance(other, LowerBound):
-                return NotImplemented
-            if self.version is None:
-                return True
-            if other.version is None:
-                return False
-
-            self_key = self.version._key_cache
-            other_key = other.version._key_cache
-            if self_key is None or other_key is None:
-                if self.version != other.version:
-                    return self.version < other.version
-            elif self_key != other_key:
-                return self_key < other_key
-
-            return self.inclusive or not other.inclusive
+        return self.inclusive or not other.inclusive
 
     def __hash__(self) -> int:
         return hash((self.version, self.inclusive))
@@ -390,78 +332,44 @@ class UpperBound:
             return NotImplemented
         return self.version == other.version and self.inclusive == other.inclusive
 
-    if USE_NATIVE_VERSION:
+    def __lt__(self, other: UpperBound) -> bool:
+        if not isinstance(other, UpperBound):
+            return NotImplemented
+        # An unbounded upper endpoint does not sort before any endpoint.
+        if self.version is None:
+            return False
+        if other.version is None:
+            return True
 
-        def __lt__(self, other: UpperBound) -> bool:
-            if not isinstance(other, UpperBound):
-                return NotImplemented
-            # An unbounded upper endpoint does not sort before any endpoint.
-            if self.version is None:
-                return False
-            if other.version is None:
-                return True
-
+        # Use cached keys when both exist; cold versions and boundaries use operators.
+        self_key = self.version._key_cache
+        other_key = other.version._key_cache
+        if self_key is None or other_key is None:
             if self.version != other.version:
                 return self.version < other.version
+        elif self_key != other_key:
+            return self_key < other_key
 
-            # v) < v]: exclusive ends earlier.
-            return not self.inclusive and other.inclusive
-    else:
+        # v) < v]: exclusive ends earlier.
+        return not self.inclusive and other.inclusive
 
-        def __lt__(self, other: UpperBound) -> bool:
-            if not isinstance(other, UpperBound):
-                return NotImplemented
-            # An unbounded upper endpoint does not sort before any endpoint.
-            if self.version is None:
-                return False
-            if other.version is None:
-                return True
+    def __gt__(self, other: UpperBound) -> bool:
+        if not isinstance(other, UpperBound):
+            return NotImplemented
+        if self.version is None:
+            return other.version is not None
+        if other.version is None:
+            return False
 
-            # Warm Python values compare their cached keys directly.
-            self_key = self.version._key_cache
-            other_key = other.version._key_cache
-            if self_key is None or other_key is None:
-                if self.version != other.version:
-                    return self.version < other.version
-            elif self_key != other_key:
-                return self_key < other_key
-
-            # v) < v]: exclusive ends earlier.
-            return not self.inclusive and other.inclusive
-
-    if USE_NATIVE_VERSION:
-
-        def __gt__(self, other: UpperBound) -> bool:
-            if not isinstance(other, UpperBound):
-                return NotImplemented
-            if self.version is None:
-                return other.version is not None
-            if other.version is None:
-                return False
-
+        self_key = self.version._key_cache
+        other_key = other.version._key_cache
+        if self_key is None or other_key is None:
             if self.version != other.version:
                 return other.version < self.version
+        elif self_key != other_key:
+            return other_key < self_key
 
-            return self.inclusive and not other.inclusive
-    else:
-
-        def __gt__(self, other: UpperBound) -> bool:
-            if not isinstance(other, UpperBound):
-                return NotImplemented
-            if self.version is None:
-                return other.version is not None
-            if other.version is None:
-                return False
-
-            self_key = self.version._key_cache
-            other_key = other.version._key_cache
-            if self_key is None or other_key is None:
-                if self.version != other.version:
-                    return other.version < self.version
-            elif self_key != other_key:
-                return other_key < self_key
-
-            return self.inclusive and not other.inclusive
+        return self.inclusive and not other.inclusive
 
     def __hash__(self) -> int:
         return hash((self.version, self.inclusive))
@@ -479,14 +387,6 @@ if TYPE_CHECKING:
 NEG_INF: Final[LowerBound] = LowerBound(None, False)
 POS_INF: Final[UpperBound] = UpperBound(None, False)
 FULL_RANGE: Final[tuple[Interval]] = ((NEG_INF, POS_INF),)
-
-
-def trim_release(release: tuple[int, ...]) -> tuple[int, ...]:
-    """Strip trailing zeros from a release tuple for normalized comparison."""
-    end = len(release)
-    while end > 1 and release[end - 1] == 0:
-        end -= 1
-    return release if end == len(release) else release[:end]
 
 
 def _next_prefix_dev0(version: Version) -> Version:
